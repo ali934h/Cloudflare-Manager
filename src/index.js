@@ -15,7 +15,8 @@ async function cfRequest(env, method, path, body = null) {
   const opts = {
     method,
     headers: {
-      Authorization: `Bearer ${env.CF_TOKEN}`,
+      'X-Auth-Key': env.CF_API_KEY,
+      'X-Auth-Email': env.CF_EMAIL,
       'Content-Type': 'application/json',
     },
   };
@@ -348,12 +349,10 @@ async function handleHelp(env, chatId) {
     '3️⃣ Tap a record to view, edit, or delete\n' +
     '4️⃣ Use “Add DNS Record” to create new entries\n\n' +
     '<b>SSL/TLS Modes:</b>\n' +
-    '🔴 <b>Off</b> — HTTP only, no encryption\n' +
+    '🔴 <b>Off</b> — HTTP only\n' +
     '🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n' +
     '🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n' +
     '🔵 <b>Full (Strict)</b> — HTTPS with valid cert on origin\n\n' +
-    '<b>Supported record types:</b>\n' +
-    '<code>A  AAAA  CNAME  TXT  MX  NS  SRV  CAA</code>\n\n' +
     '<b>Editing a record:</b>\n' +
     'Send <code>field|value</code>, e.g.:\n' +
     '• <code>content|1.2.3.4</code>\n' +
@@ -388,7 +387,6 @@ async function handleZoneMenu(env, chatId, zoneId, zoneName) {
 }
 
 async function handleSslMenu(env, chatId, zoneId, zoneName) {
-  // Get current SSL mode
   const result = await cfRequest(env, 'GET', `/zones/${zoneId}/settings/ssl`);
   const current = result.success ? result.result?.value : null;
   const currentLabel = SSL_MODES[current]?.label || current || 'Unknown';
@@ -418,21 +416,15 @@ async function handleSslSet(env, chatId, userId, zoneId, zoneName, mode) {
     await sendMessage(env, chatId, '❌ Invalid SSL mode.');
     return;
   }
-
   const result = await cfRequest(env, 'PATCH', `/zones/${zoneId}/settings/ssl`, { value: mode });
-
   if (result.success) {
     const { label, desc } = SSL_MODES[mode];
     await sendMessage(env, chatId,
-      `✅ <b>SSL/TLS mode updated</b>\n\n` +
-      `Domain: <b>${zoneName}</b>\n` +
-      `New mode: <b>${label}</b>\n` +
-      `<i>${desc}</i>`,
+      `✅ <b>SSL/TLS mode updated</b>\n\nDomain: <b>${zoneName}</b>\nNew mode: <b>${label}</b>\n<i>${desc}</i>`,
     );
   } else {
     await sendMessage(env, chatId, `❌ Failed to update SSL mode:\n<code>${JSON.stringify(result.errors)}</code>`);
   }
-
   await handleSslMenu(env, chatId, zoneId, zoneName);
 }
 
