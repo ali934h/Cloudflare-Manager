@@ -27,11 +27,12 @@ async function cfRequest(env, method, path, body = null) {
 async function sendMessage(env, chatId, text, keyboard = null) {
   const body = { chat_id: chatId, text, parse_mode: 'HTML' };
   if (keyboard) body.reply_markup = keyboard;
-  await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+  return res.json();
 }
 
 async function answerCallback(env, callbackQueryId, text = '') {
@@ -72,9 +73,7 @@ async function handleUpdate(env, update) {
   const session = getSession(userId);
 
   if (callbackQuery) {
-    // Always answer callback to stop loading spinner
     await answerCallback(env, callbackQuery.id);
-
     const data = callbackQuery.data;
 
     if (data === 'list_zones') {
@@ -92,7 +91,7 @@ async function handleUpdate(env, update) {
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
-      await handleListRecords(env, chatId, zoneId, zoneName);
+      await handleListRecords(env, chatId, userId, zoneId, zoneName);
 
     } else if (data.startsWith('addrec:')) {
       const parts = data.split(':');
@@ -121,6 +120,30 @@ async function handleUpdate(env, update) {
         await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
       }
       await handleZoneMenu(env, chatId, zoneId, zoneName);
+
+    } else if (data.startsWith('select_rec:')) {
+      // select_rec:<index>:<zoneId>:<zoneName>
+      const parts = data.split(':');
+      const index = parseInt(parts[1]);
+      const zoneId = parts[2];
+      const zoneName = parts.slice(3).join(':');
+      const session2 = getSession(userId);
+      const rec = session2.records?.[index];
+      if (!rec) {
+        await sendMessage(env, chatId, '❌ Record not found. Please refresh the list.');
+        return;
+      }
+      const proxiedIcon = rec.proxied ? '🟠' : '⚪️';
+      const info = `${proxiedIcon} <b>${rec.type}</b>\nName: <code>${rec.name}</code>\nContent: <code>${rec.content}</code>\nTTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
+      await sendMessage(env, chatId, info, {
+        inline_keyboard: [
+          [
+            { text: '✏️ Edit', callback_data: `edit:${rec.id}:${zoneId}:${zoneName}` },
+            { text: '🗑 Delete', callback_data: `del:${rec.id}:${zoneId}:${zoneName}` },
+          ],
+          [{ text: '🔙 Back to list', callback_data: `records:${zoneId}:${zoneName}` }],
+        ],
+      });
 
     } else if (data === 'main_menu') {
       clearSession(userId);
@@ -226,7 +249,7 @@ async function handleZoneMenu(env, chatId, zoneId, zoneName) {
   await sendMessage(env, chatId, `🔧 <b>${zoneName}</b>\nChoose action:`, keyboard);
 }
 
-async function handleListRecords(env, chatId, zoneId, zoneName) {
+async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
   const result = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records?per_page=100`);
 
   if (!result.success) {
@@ -239,23 +262,25 @@ async function handleListRecords(env, chatId, zoneId, zoneName) {
     return;
   }
 
-  for (const rec of result.result) {
-    const proxiedIcon = rec.proxied ? '🟠' : '⚪️';
-    const info = `${proxiedIcon} <b>${rec.type}</b> | <code>${rec.name}</code>\n→ <code>${rec.content}</code>\nTTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '✏️ Edit', callback_data: `edit:${rec.id}:${zoneId}:${zoneName}` },
-          { text: '🗑 Delete', callback_data: `del:${rec.id}:${zoneId}:${zoneName}` },
-        ],
-      ],
-    };
-    await sendMessage(env, chatId, info, keyboard);
-  }
+  // Store records in session for later access
+  setSession(userId, { records: result.result, zoneId, zoneName });
 
-  await sendMessage(env, chatId, `📊 Total: ${result.result.length} record(s)`, {
-    inline_keyboard: [[{ text: '🔙 Back', callback_data: `zone:${zoneId}:${zoneName}` }]],
+  // Build single message with all records listed
+  const lines = result.result.map((rec, i) => {
+    const icon = rec.proxied ? '🟠' : '⚪️';
+    return `${i + 1}. ${icon} <b>${rec.type}</b> <code>${rec.name}</code> → <code>${rec.content}</code>`;
   });
+
+  const text = `📋 <b>DNS Records</b> (${result.result.length})\n\n${lines.join('\n')}`;
+
+  // Build buttons: one per record
+  const buttons = result.result.map((rec, i) => [
+    { text: `${i + 1}. ${rec.type} ${rec.name}`, callback_data: `select_rec:${i}:${zoneId}:${zoneName}` },
+  ]);
+  buttons.push([{ text: '➕ Add Record', callback_data: `addrec:${zoneId}:${zoneName}` }]);
+  buttons.push([{ text: '🔙 Back', callback_data: `zone:${zoneId}:${zoneName}` }]);
+
+  await sendMessage(env, chatId, text, { inline_keyboard: buttons });
 }
 
 export default {
