@@ -57,6 +57,11 @@ function clearSession(userId) {
   sessions[userId] = { step: 'main' };
 }
 
+// Shorten IDs for callback_data (first 16 chars is enough to identify)
+function sid(id) {
+  return id.slice(0, 16);
+}
+
 async function handleUpdate(env, update) {
   const msg = update.message || update.callback_query?.message;
   const callbackQuery = update.callback_query;
@@ -75,68 +80,67 @@ async function handleUpdate(env, update) {
     await answerCallback(env, callbackQuery.id);
     const data = callbackQuery.data;
 
-    if (data === 'list_zones') {
+    if (data === 'main_menu') {
+      clearSession(userId);
+      await handleStart(env, chatId);
+
+    } else if (data === 'list_zones') {
       await handleListZones(env, chatId);
 
+    } else if (data.startsWith('z:')) {
+      // z:<sid(zoneId)> - look up full zoneId from session
+      const zoneId = session.zoneId;
+      const zoneName = session.zoneName;
+      await handleZoneMenu(env, chatId, zoneId, zoneName);
+
     } else if (data.startsWith('zone:')) {
+      // zone:<zoneId>:<zoneName> - from zone list buttons
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
       await handleZoneMenu(env, chatId, zoneId, zoneName);
 
-    } else if (data.startsWith('records:')) {
-      const parts = data.split(':');
-      const zoneId = parts[1];
-      const zoneName = parts.slice(2).join(':');
-      setSession(userId, { zoneId, zoneName });
-      await handleListRecords(env, chatId, zoneId, zoneName);
+    } else if (data === 'records') {
+      const { zoneId, zoneName } = session;
+      await handleListRecords(env, chatId, userId, zoneId, zoneName);
 
-    } else if (data.startsWith('addrec:')) {
-      const parts = data.split(':');
-      const zoneId = parts[1];
-      const zoneName = parts.slice(2).join(':');
-      setSession(userId, { step: 'add_type', zoneId, zoneName });
+    } else if (data === 'addrec') {
+      setSession(userId, { step: 'add_type' });
       await sendMessage(env, chatId, 'Enter record <b>type</b>:\n<code>A, AAAA, CNAME, TXT, MX, NS, SRV, CAA</code>');
 
-    } else if (data.startsWith('recinfo:')) {
-      // recinfo:<recId>:<zoneId>:<zoneName>
-      // Fetch record directly from CF API
-      const parts = data.split(':');
-      const recId = parts[1];
-      const zoneId = parts[2];
-      const zoneName = parts.slice(3).join(':');
-      const result = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records/${recId}`);
-      if (!result.success) {
-        await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
+    } else if (data.startsWith('ri:')) {
+      // ri:<sid(recId)> - fetch record info using full recId from session.records
+      const shortId = data.slice(3);
+      const rec = session.records?.find((r) => r.id.startsWith(shortId));
+      if (!rec) {
+        await sendMessage(env, chatId, '❌ Session expired. Please go back and refresh the list.');
         return;
       }
-      const rec = result.result;
+      const { zoneId, zoneName } = session;
       const proxiedIcon = rec.proxied ? '🟠' : '⚪️';
       const info = `${proxiedIcon} <b>${rec.type}</b>\nName: <code>${rec.name}</code>\nContent: <code>${rec.content}</code>\nTTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
+      setSession(userId, { editRecordId: rec.id });
       await sendMessage(env, chatId, info, {
         inline_keyboard: [
           [
-            { text: '✏️ Edit', callback_data: `edit:${rec.id}:${zoneId}:${zoneName}` },
-            { text: '🗑 Delete', callback_data: `del:${rec.id}:${zoneId}:${zoneName}` },
+            { text: '✏️ Edit', callback_data: 'edit_rec' },
+            { text: '🗑 Delete', callback_data: `dr:${shortId}` },
           ],
-          [{ text: '🔙 Back to list', callback_data: `records:${zoneId}:${zoneName}` }],
+          [{ text: '🔙 Back to list', callback_data: 'records' }],
         ],
       });
 
-    } else if (data.startsWith('edit:')) {
-      const parts = data.split(':');
-      const recId = parts[1];
-      const zoneId = parts[2];
-      const zoneName = parts.slice(3).join(':');
-      setSession(userId, { step: 'edit_field', editRecordId: recId, zoneId, zoneName });
-      await sendMessage(env, chatId, 'What to update? Send: <code>field|value</code>\nFields: <code>name</code>, <code>content</code>, <code>ttl</code>, <code>proxied</code>\nExample: <code>content|1.2.3.4</code>');
+    } else if (data === 'edit_rec') {
+      setSession(userId, { step: 'edit_field' });
+      await sendMessage(env, chatId, 'Send: <code>field|value</code>\nFields: <code>name</code>, <code>content</code>, <code>ttl</code>, <code>proxied</code>\nExample: <code>content|1.2.3.4</code>');
 
-    } else if (data.startsWith('del:')) {
-      const parts = data.split(':');
-      const recId = parts[1];
-      const zoneId = parts[2];
-      const zoneName = parts.slice(3).join(':');
+    } else if (data.startsWith('dr:')) {
+      // dr:<sid(recId)>
+      const shortId = data.slice(3);
+      const rec = session.records?.find((r) => r.id.startsWith(shortId));
+      const recId = rec?.id || session.editRecordId;
+      const { zoneId, zoneName } = session;
       const result = await cfRequest(env, 'DELETE', `/zones/${zoneId}/dns_records/${recId}`);
       if (result.success) {
         await sendMessage(env, chatId, '✅ Record deleted.');
@@ -144,10 +148,6 @@ async function handleUpdate(env, update) {
         await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
       }
       await handleZoneMenu(env, chatId, zoneId, zoneName);
-
-    } else if (data === 'main_menu') {
-      clearSession(userId);
-      await handleStart(env, chatId);
     }
     return;
   }
@@ -163,13 +163,13 @@ async function handleUpdate(env, update) {
 
   if (session.step === 'add_name') {
     setSession(userId, { step: 'add_content', recName: text });
-    await sendMessage(env, chatId, 'Enter record <b>content</b> (e.g. <code>1.2.3.4</code>):');
+    await sendMessage(env, chatId, 'Enter record <b>content</b>:');
     return;
   }
 
   if (session.step === 'add_content') {
     setSession(userId, { step: 'add_ttl', recContent: text });
-    await sendMessage(env, chatId, 'Enter <b>TTL</b> (<code>1</code> = Auto, or number like <code>3600</code>):');
+    await sendMessage(env, chatId, 'Enter <b>TTL</b> (<code>1</code> = Auto):');
     return;
   }
 
@@ -183,12 +183,13 @@ async function handleUpdate(env, update) {
       proxied: false,
     });
     if (result.success) {
-      await sendMessage(env, chatId, `✅ Record added:\n<code>${session.recType} ${session.recName} → ${session.recContent}</code>`);
+      await sendMessage(env, chatId, `✅ Added: <code>${session.recType} ${session.recName} → ${session.recContent}</code>`);
     } else {
       await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
     }
     const { zoneId, zoneName } = session;
     clearSession(userId);
+    setSession(userId, { zoneId, zoneName });
     await handleZoneMenu(env, chatId, zoneId, zoneName);
     return;
   }
@@ -196,7 +197,7 @@ async function handleUpdate(env, update) {
   if (session.step === 'edit_field') {
     const parts = text.split('|');
     if (parts.length !== 2) {
-      await sendMessage(env, chatId, '❌ Invalid format. Use: <code>field|value</code>');
+      await sendMessage(env, chatId, '❌ Invalid. Use: <code>field|value</code>');
       return;
     }
     const [field, value] = parts;
@@ -213,6 +214,7 @@ async function handleUpdate(env, update) {
     }
     const { zoneId, zoneName } = session;
     clearSession(userId);
+    setSession(userId, { zoneId, zoneName });
     await handleZoneMenu(env, chatId, zoneId, zoneName);
     return;
   }
@@ -221,10 +223,9 @@ async function handleUpdate(env, update) {
 }
 
 async function handleStart(env, chatId) {
-  const keyboard = {
+  await sendMessage(env, chatId, '👋 <b>Cloudflare Manager</b>\nSelect an option:', {
     inline_keyboard: [[{ text: '🌐 My Domains', callback_data: 'list_zones' }]],
-  };
-  await sendMessage(env, chatId, '👋 <b>Cloudflare Manager</b>\nSelect an option:', keyboard);
+  });
 }
 
 async function handleListZones(env, chatId) {
@@ -239,17 +240,16 @@ async function handleListZones(env, chatId) {
 }
 
 async function handleZoneMenu(env, chatId, zoneId, zoneName) {
-  const keyboard = {
+  await sendMessage(env, chatId, `🔧 <b>${zoneName}</b>\nChoose action:`, {
     inline_keyboard: [
-      [{ text: '📋 List DNS Records', callback_data: `records:${zoneId}:${zoneName}` }],
-      [{ text: '➕ Add DNS Record', callback_data: `addrec:${zoneId}:${zoneName}` }],
+      [{ text: '📋 List DNS Records', callback_data: 'records' }],
+      [{ text: '➕ Add DNS Record', callback_data: 'addrec' }],
       [{ text: '🔙 Back to Domains', callback_data: 'list_zones' }],
     ],
-  };
-  await sendMessage(env, chatId, `🔧 <b>${zoneName}</b>\nChoose action:`, keyboard);
+  });
 }
 
-async function handleListRecords(env, chatId, zoneId, zoneName) {
+async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
   const result = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records?per_page=100`);
 
   if (!result.success) {
@@ -259,39 +259,36 @@ async function handleListRecords(env, chatId, zoneId, zoneName) {
 
   if (!result.result || result.result.length === 0) {
     await sendMessage(env, chatId, '❌ No DNS records found.', {
-      inline_keyboard: [[{ text: '➕ Add Record', callback_data: `addrec:${zoneId}:${zoneName}` }]],
+      inline_keyboard: [
+        [{ text: '➕ Add Record', callback_data: 'addrec' }],
+        [{ text: '🔙 Back', callback_data: 'z:' }],
+      ],
     });
     return;
   }
+
+  // Store full records in session for later access
+  setSession(userId, { records: result.result });
 
   const lines = result.result.map((rec, i) => {
     const icon = rec.proxied ? '🟠' : '⚪️';
     return `${i + 1}. ${icon} <b>${rec.type}</b> <code>${rec.name}</code>\n    → <code>${rec.content}</code>`;
   });
 
-  const text = `📋 <b>DNS Records — ${zoneName}</b> (${result.result.length})\n\n${lines.join('\n\n')}`;
+  const text = `📋 <b>${zoneName}</b> — ${result.result.length} record(s)\n\n${lines.join('\n\n')}`;
 
-  // Each record gets a button that fetches it fresh from CF API
+  // Use short IDs in callback_data (ri: = record info)
   const buttons = result.result.map((rec, i) => [
-    { text: `${i + 1}. ${rec.type} — ${rec.name}`, callback_data: `recinfo:${rec.id}:${zoneId}:${zoneName}` },
+    { text: `${i + 1}. ${rec.type} — ${rec.name}`, callback_data: `ri:${sid(rec.id)}` },
   ]);
-  buttons.push([{ text: '➕ Add Record', callback_data: `addrec:${zoneId}:${zoneName}` }]);
-  buttons.push([{ text: '🔙 Back', callback_data: `zone:${zoneId}:${zoneName}` }]);
+  buttons.push([{ text: '➕ Add Record', callback_data: 'addrec' }]);
+  buttons.push([{ text: '🔙 Back', callback_data: 'z:' }]);
 
   await sendMessage(env, chatId, text, { inline_keyboard: buttons });
 }
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/debug') {
-      const result = await cfRequest(env, 'GET', '/zones/56d436913fe5c605d4fe40d10cefac09/dns_records?per_page=10');
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
     if (request.method !== 'POST') return new Response('OK');
     try {
       const update = await request.json();
