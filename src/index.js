@@ -79,10 +79,17 @@ function sid(id) {
 }
 
 const SSL_MODES = {
-  off: { label: '🔴 Off', desc: 'No SSL — HTTP only' },
-  flexible: { label: '🟡 Flexible', desc: 'SSL to visitor, HTTP to origin' },
-  full: { label: '🟢 Full', desc: 'SSL to visitor and origin (self-signed ok)' },
-  strict: { label: '🔵 Full (Strict)', desc: 'SSL with valid certificate on origin' },
+  off:      { label: '🔴 Off',          desc: 'No SSL — HTTP only' },
+  flexible: { label: '🟡 Flexible',     desc: 'SSL to visitor, HTTP to origin' },
+  full:     { label: '🟢 Full',         desc: 'SSL to visitor and origin (self-signed ok)' },
+  strict:   { label: '🔵 Full (Strict)', desc: 'SSL with valid certificate on origin' },
+};
+
+const TLS_VERSIONS = {
+  '1.0': { label: 'TLS 1.0', desc: 'Oldest — not recommended' },
+  '1.1': { label: 'TLS 1.1', desc: 'Legacy — not recommended' },
+  '1.2': { label: 'TLS 1.2', desc: 'Widely supported — recommended minimum' },
+  '1.3': { label: 'TLS 1.3', desc: 'Latest — fastest & most secure' },
 };
 
 async function handleUpdate(env, update) {
@@ -124,33 +131,30 @@ async function handleUpdate(env, update) {
       await handleZoneMenu(env, chatId, session.zoneId, session.zoneName);
 
     } else if (data === 'records') {
-      if (!session.zoneId) {
-        await sendMessage(env, chatId, '❌ Session lost. Please use /start again.');
-        return;
-      }
+      if (!session.zoneId) { await sendMessage(env, chatId, '❌ Session lost. Please use /start again.'); return; }
       await handleListRecords(env, chatId, userId, session.zoneId, session.zoneName);
 
     } else if (data === 'addrec') {
       setSession(userId, { step: 'add_type' });
-      await sendMessage(env, chatId,
-        '➕ <b>Add DNS Record</b>\n\nSend the record <b>type</b>:\n<code>A  AAAA  CNAME  TXT  MX  NS  SRV  CAA</code>\n\n/cancel to abort',
-      );
+      await sendMessage(env, chatId, '➕ <b>Add DNS Record</b>\n\nSend the record <b>type</b>:\n<code>A  AAAA  CNAME  TXT  MX  NS  SRV  CAA</code>\n\n/cancel to abort');
 
     } else if (data === 'ssl_menu') {
-      if (!session.zoneId) {
-        await sendMessage(env, chatId, '❌ Session lost. Please use /start again.');
-        return;
-      }
+      if (!session.zoneId) { await sendMessage(env, chatId, '❌ Session lost. Please use /start again.'); return; }
       await handleSslMenu(env, chatId, session.zoneId, session.zoneName);
 
     } else if (data.startsWith('ssl_set:')) {
-      const mode = data.slice(8);
-      await handleSslSet(env, chatId, userId, session.zoneId, session.zoneName, mode);
+      await handleSslSet(env, chatId, session.zoneId, session.zoneName, data.slice(8));
+
+    } else if (data === 'tls_menu') {
+      if (!session.zoneId) { await sendMessage(env, chatId, '❌ Session lost. Please use /start again.'); return; }
+      await handleTlsMenu(env, chatId, session.zoneId, session.zoneName);
+
+    } else if (data.startsWith('tls_set:')) {
+      await handleTlsSet(env, chatId, session.zoneId, session.zoneName, data.slice(8));
 
     } else if (data.startsWith('ri:')) {
       const shortId = data.slice(3);
       let rec = session.records?.find((r) => r.id.startsWith(shortId));
-
       if (!rec && session.zoneId) {
         const fresh = await cfRequest(env, 'GET', `/zones/${session.zoneId}/dns_records?per_page=100`);
         if (fresh.success) {
@@ -158,33 +162,23 @@ async function handleUpdate(env, update) {
           rec = fresh.result?.find((r) => r.id.startsWith(shortId));
         }
       }
-
       if (!rec) {
         await sendMessage(env, chatId, '❌ Record not found. Please refresh.', {
           inline_keyboard: [[{ text: '🔄 Refresh list', callback_data: 'records' }]],
         });
         return;
       }
-
       setSession(userId, { editRecordId: rec.id });
       const proxiedIcon = rec.proxied ? '🟠 Proxied' : '⚪️ Direct';
-      const info =
-        `📌 <b>Record Details</b>\n\n` +
-        `Type: <b>${rec.type}</b>\n` +
-        `Name: <code>${rec.name}</code>\n` +
-        `Content: <code>${rec.content}</code>\n` +
-        `TTL: <code>${rec.ttl === 1 ? 'Auto' : rec.ttl}</code>\n` +
-        `Status: ${proxiedIcon}`;
-
-      await sendMessage(env, chatId, info, {
-        inline_keyboard: [
-          [
-            { text: '✏️ Edit', callback_data: 'edit_rec' },
-            { text: '🗑 Delete', callback_data: `delconfirm:${shortId}` },
+      await sendMessage(env, chatId,
+        `📌 <b>Record Details</b>\n\nType: <b>${rec.type}</b>\nName: <code>${rec.name}</code>\nContent: <code>${rec.content}</code>\nTTL: <code>${rec.ttl === 1 ? 'Auto' : rec.ttl}</code>\nStatus: ${proxiedIcon}`,
+        {
+          inline_keyboard: [
+            [{ text: '✏️ Edit', callback_data: 'edit_rec' }, { text: '🗑 Delete', callback_data: `delconfirm:${shortId}` }],
+            [{ text: '🔙 Back to list', callback_data: 'records' }],
           ],
-          [{ text: '🔙 Back to list', callback_data: 'records' }],
-        ],
-      });
+        },
+      );
 
     } else if (data === 'edit_rec') {
       setSession(userId, { step: 'edit_field' });
@@ -195,17 +189,14 @@ async function handleUpdate(env, update) {
     } else if (data.startsWith('delconfirm:')) {
       const shortId = data.slice(11);
       const rec = session.records?.find((r) => r.id.startsWith(shortId));
-      const name = rec?.name || 'this record';
       setSession(userId, { pendingDeleteId: shortId });
       await sendMessage(env, chatId,
-        `⚠️ <b>Confirm Delete</b>\n\nAre you sure you want to delete:\n<code>${name}</code>`,
+        `⚠️ <b>Confirm Delete</b>\n\nAre you sure you want to delete:\n<code>${rec?.name || 'this record'}</code>`,
         {
-          inline_keyboard: [
-            [
-              { text: '✅ Yes, delete', callback_data: `dr:${shortId}` },
-              { text: '❌ Cancel', callback_data: 'records' },
-            ],
-          ],
+          inline_keyboard: [[
+            { text: '✅ Yes, delete', callback_data: `dr:${shortId}` },
+            { text: '❌ Cancel', callback_data: 'records' },
+          ]],
         },
       );
 
@@ -229,20 +220,13 @@ async function handleUpdate(env, update) {
   const text = update.message?.text?.trim();
   if (!text) return;
 
-  if (text === '/start') {
-    sessions[userId] = {};
-    await handleStart(env, chatId);
-    return;
-  }
+  if (text === '/start') { sessions[userId] = {}; await handleStart(env, chatId); return; }
   if (text === '/help') { await handleHelp(env, chatId); return; }
   if (text === '/domains') { await handleListZones(env, chatId); return; }
   if (text === '/cancel') {
     resetStep(userId);
-    if (session.zoneId) {
-      await handleZoneMenu(env, chatId, session.zoneId, session.zoneName);
-    } else {
-      await handleStart(env, chatId);
-    }
+    if (session.zoneId) await handleZoneMenu(env, chatId, session.zoneId, session.zoneName);
+    else await handleStart(env, chatId);
     return;
   }
 
@@ -281,11 +265,7 @@ async function handleUpdate(env, update) {
     });
     if (result.success) {
       await sendMessage(env, chatId,
-        `✅ <b>Record Added Successfully</b>\n\n` +
-        `Type: <b>${session.recType}</b>\n` +
-        `Name: <code>${session.recName}</code>\n` +
-        `Content: <code>${session.recContent}</code>\n` +
-        `TTL: <code>${ttl === 1 ? 'Auto' : ttl}</code>`,
+        `✅ <b>Record Added Successfully</b>\n\nType: <b>${session.recType}</b>\nName: <code>${session.recName}</code>\nContent: <code>${session.recContent}</code>\nTTL: <code>${ttl === 1 ? 'Auto' : ttl}</code>`,
       );
     } else {
       await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
@@ -307,7 +287,6 @@ async function handleUpdate(env, update) {
     if (field === 'ttl') patch.ttl = parseInt(value);
     else if (field === 'proxied') patch.proxied = value === 'true';
     else patch[field] = value;
-
     const result = await cfRequest(env, 'PATCH', `/zones/${session.zoneId}/dns_records/${session.editRecordId}`, patch);
     if (result.success) {
       await sendMessage(env, chatId, `✅ <b>Record updated successfully.</b>\n<code>${field}</code> → <code>${value}</code>`);
@@ -336,32 +315,14 @@ async function handleStart(env, chatId) {
 }
 
 async function handleHelp(env, chatId) {
-  const helpText =
+  await sendMessage(env, chatId,
     '❓ <b>Cloudflare Manager — Help</b>\n\n' +
-    '<b>Commands:</b>\n' +
-    '/start — Main menu\n' +
-    '/domains — List all your domains\n' +
-    '/help — Show this help\n' +
-    '/cancel — Cancel current action\n\n' +
-    '<b>How to manage DNS:</b>\n' +
-    '1️⃣ Select a domain from /domains\n' +
-    '2️⃣ Choose “List DNS Records”\n' +
-    '3️⃣ Tap a record to view, edit, or delete\n' +
-    '4️⃣ Use “Add DNS Record” to create new entries\n\n' +
-    '<b>SSL/TLS Modes:</b>\n' +
-    '🔴 <b>Off</b> — HTTP only\n' +
-    '🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n' +
-    '🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n' +
-    '🔵 <b>Full (Strict)</b> — HTTPS with valid cert on origin\n\n' +
-    '<b>Editing a record:</b>\n' +
-    'Send <code>field|value</code>, e.g.:\n' +
-    '• <code>content|1.2.3.4</code>\n' +
-    '• <code>proxied|true</code>\n' +
-    '• <code>ttl|3600</code>';
-
-  await sendMessage(env, chatId, helpText, {
-    inline_keyboard: [[{ text: '🗂 Go to Domains', callback_data: 'list_zones' }]],
-  });
+    '<b>Commands:</b>\n/start — Main menu\n/domains — List domains\n/help — This help\n/cancel — Cancel action\n\n' +
+    '<b>SSL/TLS Modes:</b>\n🔴 Off — HTTP only\n🟡 Flexible — HTTPS to visitor only\n🟢 Full — HTTPS both sides\n🔵 Strict — valid cert required\n\n' +
+    '<b>Min TLS Version:</b>\nSets the minimum TLS version accepted by Cloudflare.\nRecommended: TLS 1.2 or 1.3\n\n' +
+    '<b>Edit DNS record:</b>\nSend <code>field|value</code> e.g. <code>content|1.2.3.4</code>',
+    { inline_keyboard: [[{ text: '🗂 Go to Domains', callback_data: 'list_zones' }]] },
+  );
 }
 
 async function handleListZones(env, chatId) {
@@ -380,7 +341,7 @@ async function handleZoneMenu(env, chatId, zoneId, zoneName) {
     inline_keyboard: [
       [{ text: '📋 List DNS Records', callback_data: 'records' }],
       [{ text: '➕ Add DNS Record', callback_data: 'addrec' }],
-      [{ text: '🔒 SSL/TLS Settings', callback_data: 'ssl_menu' }],
+      [{ text: '🔒 SSL/TLS Mode', callback_data: 'ssl_menu' }, { text: '🛡 TLS Version', callback_data: 'tls_menu' }],
       [{ text: '🔙 Back to Domains', callback_data: 'list_zones' }],
     ],
   });
@@ -391,53 +352,67 @@ async function handleSslMenu(env, chatId, zoneId, zoneName) {
   const current = result.success ? result.result?.value : null;
   const currentLabel = SSL_MODES[current]?.label || current || 'Unknown';
 
-  const text =
-    `🔒 <b>SSL/TLS — ${zoneName}</b>\n\n` +
-    `Current mode: <b>${currentLabel}</b>\n\n` +
-    `🔴 <b>Off</b> — HTTP only\n` +
-    `🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n` +
-    `🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n` +
-    `🔵 <b>Full (Strict)</b> — HTTPS with valid cert required\n\n` +
-    `Select a new mode:`;
-
-  const buttons = Object.entries(SSL_MODES).map(([mode, { label }]) => [
-    {
-      text: mode === current ? `✅ ${label} (current)` : label,
-      callback_data: `ssl_set:${mode}`,
-    },
-  ]);
+  const buttons = Object.entries(SSL_MODES).map(([mode, { label }]) => [{
+    text: mode === current ? `✅ ${label} (current)` : label,
+    callback_data: `ssl_set:${mode}`,
+  }]);
   buttons.push([{ text: '🔙 Back', callback_data: 'zone_menu' }]);
 
-  await sendMessage(env, chatId, text, { inline_keyboard: buttons });
+  await sendMessage(env, chatId,
+    `🔒 <b>SSL/TLS Mode — ${zoneName}</b>\n\nCurrent: <b>${currentLabel}</b>\n\n🔴 <b>Off</b> — HTTP only\n🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n🔵 <b>Full (Strict)</b> — valid cert required\n\nSelect a mode:`,
+    { inline_keyboard: buttons },
+  );
 }
 
-async function handleSslSet(env, chatId, userId, zoneId, zoneName, mode) {
-  if (!SSL_MODES[mode]) {
-    await sendMessage(env, chatId, '❌ Invalid SSL mode.');
-    return;
-  }
+async function handleSslSet(env, chatId, zoneId, zoneName, mode) {
+  if (!SSL_MODES[mode]) { await sendMessage(env, chatId, '❌ Invalid SSL mode.'); return; }
   const result = await cfRequest(env, 'PATCH', `/zones/${zoneId}/settings/ssl`, { value: mode });
   if (result.success) {
     const { label, desc } = SSL_MODES[mode];
-    await sendMessage(env, chatId,
-      `✅ <b>SSL/TLS mode updated</b>\n\nDomain: <b>${zoneName}</b>\nNew mode: <b>${label}</b>\n<i>${desc}</i>`,
-    );
+    await sendMessage(env, chatId, `✅ <b>SSL mode updated</b>\nDomain: <b>${zoneName}</b>\nMode: <b>${label}</b>\n<i>${desc}</i>`);
   } else {
-    await sendMessage(env, chatId, `❌ Failed to update SSL mode:\n<code>${JSON.stringify(result.errors)}</code>`);
+    await sendMessage(env, chatId, `❌ Failed:\n<code>${JSON.stringify(result.errors)}</code>`);
   }
   await handleSslMenu(env, chatId, zoneId, zoneName);
 }
 
+async function handleTlsMenu(env, chatId, zoneId, zoneName) {
+  const result = await cfRequest(env, 'GET', `/zones/${zoneId}/settings/min_tls_version`);
+  const current = result.success ? result.result?.value : null;
+  const currentLabel = TLS_VERSIONS[current]?.label || current || 'Unknown';
+
+  const buttons = Object.entries(TLS_VERSIONS).map(([ver, { label }]) => [{
+    text: ver === current ? `✅ ${label} (current)` : label,
+    callback_data: `tls_set:${ver}`,
+  }]);
+  buttons.push([{ text: '🔙 Back', callback_data: 'zone_menu' }]);
+
+  await sendMessage(env, chatId,
+    `🛡 <b>Minimum TLS Version — ${zoneName}</b>\n\nCurrent: <b>${currentLabel}</b>\n\n<b>TLS 1.0</b> — Oldest, not recommended\n<b>TLS 1.1</b> — Legacy, not recommended\n<b>TLS 1.2</b> — Recommended minimum\n<b>TLS 1.3</b> — Latest, fastest & most secure\n\nSelect minimum version:`,
+    { inline_keyboard: buttons },
+  );
+}
+
+async function handleTlsSet(env, chatId, zoneId, zoneName, ver) {
+  if (!TLS_VERSIONS[ver]) { await sendMessage(env, chatId, '❌ Invalid TLS version.'); return; }
+  const result = await cfRequest(env, 'PATCH', `/zones/${zoneId}/settings/min_tls_version`, { value: ver });
+  if (result.success) {
+    const { label, desc } = TLS_VERSIONS[ver];
+    await sendMessage(env, chatId, `✅ <b>TLS version updated</b>\nDomain: <b>${zoneName}</b>\nMin TLS: <b>${label}</b>\n<i>${desc}</i>`);
+  } else {
+    await sendMessage(env, chatId, `❌ Failed:\n<code>${JSON.stringify(result.errors)}</code>`);
+  }
+  await handleTlsMenu(env, chatId, zoneId, zoneName);
+}
+
 async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
   const result = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records?per_page=100`);
-
   if (!result.success) {
     await sendMessage(env, chatId, `❌ CF API Error:\n<code>${JSON.stringify(result.errors)}</code>`);
     return;
   }
-
   if (!result.result || result.result.length === 0) {
-    await sendMessage(env, chatId, '❌ No DNS records found for this domain.', {
+    await sendMessage(env, chatId, '❌ No DNS records found.', {
       inline_keyboard: [
         [{ text: '➕ Add Record', callback_data: 'addrec' }],
         [{ text: '🔙 Back', callback_data: 'zone_menu' }],
@@ -445,29 +420,22 @@ async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
     });
     return;
   }
-
   setSession(userId, { records: result.result });
-
   const typeIcon = { A: '🟦', AAAA: '🟦', CNAME: '🔗', TXT: '📝', MX: '📧', NS: '📍', SRV: '⚙️', CAA: '🔒' };
-
   const lines = result.result.map((rec, i) => {
     const icon = typeIcon[rec.type] || '🟦';
     const proxied = rec.proxied ? ' 🟠' : '';
     return `${i + 1}. ${icon} <b>${rec.type}</b>${proxied} <code>${rec.name}</code>\n    → <code>${rec.content}</code>`;
   });
-
-  const text = `📋 <b>${zoneName}</b>\n${result.result.length} record(s)\n\n${lines.join('\n\n')}`;
-
   const buttons = result.result.map((rec, i) => [
     { text: `${i + 1}. ${rec.type} — ${rec.name}`, callback_data: `ri:${sid(rec.id)}` },
   ]);
-  buttons.push([
-    { text: '➕ Add Record', callback_data: 'addrec' },
-    { text: '🔄 Refresh', callback_data: 'records' },
-  ]);
+  buttons.push([{ text: '➕ Add Record', callback_data: 'addrec' }, { text: '🔄 Refresh', callback_data: 'records' }]);
   buttons.push([{ text: '🔙 Back', callback_data: 'zone_menu' }]);
-
-  await sendMessage(env, chatId, text, { inline_keyboard: buttons });
+  await sendMessage(env, chatId,
+    `📋 <b>${zoneName}</b>\n${result.result.length} record(s)\n\n${lines.join('\n\n')}`,
+    { inline_keyboard: buttons },
+  );
 }
 
 export default {
@@ -481,9 +449,7 @@ export default {
     try {
       const update = await request.json();
       ctx.waitUntil(handleUpdate(env, update));
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
     return new Response('OK');
   },
 };
