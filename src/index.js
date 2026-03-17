@@ -38,8 +38,6 @@ async function sendMessage(env, chatId, text, keyboard = null) {
   });
 }
 
-// In-memory session — only used for multi-step text input
-// zoneId/zoneName are passed via callback_data to survive Worker restarts
 const sessions = {};
 
 function getSession(userId) {
@@ -74,42 +72,32 @@ async function handleUpdate(env, update) {
 
     if (data === 'list_zones') {
       await handleListZones(env, chatId);
-
     } else if (data.startsWith('zone:')) {
-      // zone:<zoneId>:<zoneName>
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
       await handleZoneMenu(env, chatId, zoneId, zoneName);
-
     } else if (data.startsWith('records:')) {
-      // records:<zoneId>:<zoneName>
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
       await handleListRecords(env, chatId, zoneId, zoneName);
-
     } else if (data.startsWith('addrec:')) {
-      // addrec:<zoneId>:<zoneName>
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { step: 'add_type', zoneId, zoneName });
       await sendMessage(env, chatId, 'Enter record <b>type</b>:\n<code>A, AAAA, CNAME, TXT, MX, NS, SRV, CAA</code>');
-
     } else if (data.startsWith('edit:')) {
-      // edit:<recId>:<zoneId>:<zoneName>
       const parts = data.split(':');
       const recId = parts[1];
       const zoneId = parts[2];
       const zoneName = parts.slice(3).join(':');
       setSession(userId, { step: 'edit_field', editRecordId: recId, zoneId, zoneName });
       await sendMessage(env, chatId, 'What to update? Send: <code>field|value</code>\nFields: <code>name</code>, <code>content</code>, <code>ttl</code>, <code>proxied</code>\nExample: <code>content|1.2.3.4</code>');
-
     } else if (data.startsWith('del:')) {
-      // del:<recId>:<zoneId>:<zoneName>
       const parts = data.split(':');
       const recId = parts[1];
       const zoneId = parts[2];
@@ -121,7 +109,6 @@ async function handleUpdate(env, update) {
         await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
       }
       await handleZoneMenu(env, chatId, zoneId, zoneName);
-
     } else if (data === 'main_menu') {
       clearSession(userId);
       await handleStart(env, chatId);
@@ -251,6 +238,16 @@ async function handleListRecords(env, chatId, zoneId, zoneName) {
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Temporary debug endpoint — remove after testing
+    if (url.pathname === '/debug') {
+      const result = await cfRequest(env, 'GET', '/zones/56d436913fe5c605d4fe40d10cefac09/dns_records?per_page=10');
+      return new Response(JSON.stringify(result, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
     if (request.method !== 'POST') return new Response('OK');
     try {
       const update = await request.json();
