@@ -51,6 +51,7 @@ async function setMyCommands(env) {
         { command: 'start', description: '🌐 Main menu' },
         { command: 'domains', description: '🗂 List all domains' },
         { command: 'help', description: '❓ How to use this bot' },
+        { command: 'cancel', description: '❌ Cancel current action' },
       ],
     }),
   });
@@ -75,6 +76,13 @@ function resetStep(userId) {
 function sid(id) {
   return id.slice(0, 16);
 }
+
+const SSL_MODES = {
+  off: { label: '🔴 Off', desc: 'No SSL — HTTP only' },
+  flexible: { label: '🟡 Flexible', desc: 'SSL to visitor, HTTP to origin' },
+  full: { label: '🟢 Full', desc: 'SSL to visitor and origin (self-signed ok)' },
+  strict: { label: '🔵 Full (Strict)', desc: 'SSL with valid certificate on origin' },
+};
 
 async function handleUpdate(env, update) {
   const msg = update.message || update.callback_query?.message;
@@ -126,6 +134,17 @@ async function handleUpdate(env, update) {
       await sendMessage(env, chatId,
         '➕ <b>Add DNS Record</b>\n\nSend the record <b>type</b>:\n<code>A  AAAA  CNAME  TXT  MX  NS  SRV  CAA</code>\n\n/cancel to abort',
       );
+
+    } else if (data === 'ssl_menu') {
+      if (!session.zoneId) {
+        await sendMessage(env, chatId, '❌ Session lost. Please use /start again.');
+        return;
+      }
+      await handleSslMenu(env, chatId, session.zoneId, session.zoneName);
+
+    } else if (data.startsWith('ssl_set:')) {
+      const mode = data.slice(8);
+      await handleSslSet(env, chatId, userId, session.zoneId, session.zoneName, mode);
 
     } else if (data.startsWith('ri:')) {
       const shortId = data.slice(3);
@@ -209,20 +228,13 @@ async function handleUpdate(env, update) {
   const text = update.message?.text?.trim();
   if (!text) return;
 
-  // Global commands — work from anywhere
   if (text === '/start') {
     sessions[userId] = {};
     await handleStart(env, chatId);
     return;
   }
-  if (text === '/help') {
-    await handleHelp(env, chatId);
-    return;
-  }
-  if (text === '/domains') {
-    await handleListZones(env, chatId);
-    return;
-  }
+  if (text === '/help') { await handleHelp(env, chatId); return; }
+  if (text === '/domains') { await handleListZones(env, chatId); return; }
   if (text === '/cancel') {
     resetStep(userId);
     if (session.zoneId) {
@@ -335,6 +347,11 @@ async function handleHelp(env, chatId) {
     '2️⃣ Choose “List DNS Records”\n' +
     '3️⃣ Tap a record to view, edit, or delete\n' +
     '4️⃣ Use “Add DNS Record” to create new entries\n\n' +
+    '<b>SSL/TLS Modes:</b>\n' +
+    '🔴 <b>Off</b> — HTTP only, no encryption\n' +
+    '🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n' +
+    '🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n' +
+    '🔵 <b>Full (Strict)</b> — HTTPS with valid cert on origin\n\n' +
     '<b>Supported record types:</b>\n' +
     '<code>A  AAAA  CNAME  TXT  MX  NS  SRV  CAA</code>\n\n' +
     '<b>Editing a record:</b>\n' +
@@ -364,9 +381,59 @@ async function handleZoneMenu(env, chatId, zoneId, zoneName) {
     inline_keyboard: [
       [{ text: '📋 List DNS Records', callback_data: 'records' }],
       [{ text: '➕ Add DNS Record', callback_data: 'addrec' }],
+      [{ text: '🔒 SSL/TLS Settings', callback_data: 'ssl_menu' }],
       [{ text: '🔙 Back to Domains', callback_data: 'list_zones' }],
     ],
   });
+}
+
+async function handleSslMenu(env, chatId, zoneId, zoneName) {
+  // Get current SSL mode
+  const result = await cfRequest(env, 'GET', `/zones/${zoneId}/settings/ssl`);
+  const current = result.success ? result.result?.value : null;
+  const currentLabel = SSL_MODES[current]?.label || current || 'Unknown';
+
+  const text =
+    `🔒 <b>SSL/TLS — ${zoneName}</b>\n\n` +
+    `Current mode: <b>${currentLabel}</b>\n\n` +
+    `🔴 <b>Off</b> — HTTP only\n` +
+    `🟡 <b>Flexible</b> — HTTPS to visitor, HTTP to origin\n` +
+    `🟢 <b>Full</b> — HTTPS end-to-end (self-signed ok)\n` +
+    `🔵 <b>Full (Strict)</b> — HTTPS with valid cert required\n\n` +
+    `Select a new mode:`;
+
+  const buttons = Object.entries(SSL_MODES).map(([mode, { label }]) => [
+    {
+      text: mode === current ? `✅ ${label} (current)` : label,
+      callback_data: `ssl_set:${mode}`,
+    },
+  ]);
+  buttons.push([{ text: '🔙 Back', callback_data: 'zone_menu' }]);
+
+  await sendMessage(env, chatId, text, { inline_keyboard: buttons });
+}
+
+async function handleSslSet(env, chatId, userId, zoneId, zoneName, mode) {
+  if (!SSL_MODES[mode]) {
+    await sendMessage(env, chatId, '❌ Invalid SSL mode.');
+    return;
+  }
+
+  const result = await cfRequest(env, 'PATCH', `/zones/${zoneId}/settings/ssl`, { value: mode });
+
+  if (result.success) {
+    const { label, desc } = SSL_MODES[mode];
+    await sendMessage(env, chatId,
+      `✅ <b>SSL/TLS mode updated</b>\n\n` +
+      `Domain: <b>${zoneName}</b>\n` +
+      `New mode: <b>${label}</b>\n` +
+      `<i>${desc}</i>`,
+    );
+  } else {
+    await sendMessage(env, chatId, `❌ Failed to update SSL mode:\n<code>${JSON.stringify(result.errors)}</code>`);
+  }
+
+  await handleSslMenu(env, chatId, zoneId, zoneName);
 }
 
 async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
@@ -413,13 +480,11 @@ async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
 
 export default {
   async fetch(request, env, ctx) {
-    // Register bot commands on first load
     const url = new URL(request.url);
     if (url.pathname === '/setup') {
       await setMyCommands(env);
       return new Response('Commands registered!');
     }
-
     if (request.method !== 'POST') return new Response('OK');
     try {
       const update = await request.json();
