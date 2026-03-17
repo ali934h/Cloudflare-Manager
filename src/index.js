@@ -45,7 +45,7 @@ async function answerCallback(env, callbackQueryId, text = '') {
 const sessions = {};
 
 function getSession(userId) {
-  if (!sessions[userId]) sessions[userId] = { step: 'main' };
+  if (!sessions[userId]) sessions[userId] = {};
   return sessions[userId];
 }
 
@@ -53,11 +53,17 @@ function setSession(userId, data) {
   sessions[userId] = { ...sessions[userId], ...data };
 }
 
-function clearSession(userId) {
-  sessions[userId] = { step: 'main' };
+function resetStep(userId) {
+  // Only reset the step, keep zoneId/zoneName/records
+  const s = sessions[userId] || {};
+  sessions[userId] = {
+    zoneId: s.zoneId,
+    zoneName: s.zoneName,
+    records: s.records,
+  };
 }
 
-// Shorten IDs for callback_data (first 16 chars is enough to identify)
+// First 16 chars of an ID for short callback_data
 function sid(id) {
   return id.slice(0, 16);
 }
@@ -81,28 +87,29 @@ async function handleUpdate(env, update) {
     const data = callbackQuery.data;
 
     if (data === 'main_menu') {
-      clearSession(userId);
+      sessions[userId] = {};
       await handleStart(env, chatId);
 
     } else if (data === 'list_zones') {
       await handleListZones(env, chatId);
 
-    } else if (data.startsWith('z:')) {
-      // z:<sid(zoneId)> - look up full zoneId from session
-      const zoneId = session.zoneId;
-      const zoneName = session.zoneName;
-      await handleZoneMenu(env, chatId, zoneId, zoneName);
-
     } else if (data.startsWith('zone:')) {
-      // zone:<zoneId>:<zoneName> - from zone list buttons
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
-      setSession(userId, { zoneId, zoneName });
+      sessions[userId] = { zoneId, zoneName };
+      await handleZoneMenu(env, chatId, zoneId, zoneName);
+
+    } else if (data === 'zone_menu') {
+      const { zoneId, zoneName } = session;
       await handleZoneMenu(env, chatId, zoneId, zoneName);
 
     } else if (data === 'records') {
       const { zoneId, zoneName } = session;
+      if (!zoneId) {
+        await sendMessage(env, chatId, '❌ Session lost. Please /start again.');
+        return;
+      }
       await handleListRecords(env, chatId, userId, zoneId, zoneName);
 
     } else if (data === 'addrec') {
@@ -110,17 +117,34 @@ async function handleUpdate(env, update) {
       await sendMessage(env, chatId, 'Enter record <b>type</b>:\n<code>A, AAAA, CNAME, TXT, MX, NS, SRV, CAA</code>');
 
     } else if (data.startsWith('ri:')) {
-      // ri:<sid(recId)> - fetch record info using full recId from session.records
+      // ri:<sid(recId)> — find in session or re-fetch
       const shortId = data.slice(3);
-      const rec = session.records?.find((r) => r.id.startsWith(shortId));
+      let rec = session.records?.find((r) => r.id.startsWith(shortId));
+
       if (!rec) {
-        await sendMessage(env, chatId, '❌ Session expired. Please go back and refresh the list.');
+        // Re-fetch records from CF API
+        const { zoneId } = session;
+        if (!zoneId) {
+          await sendMessage(env, chatId, '❌ Session lost. Please /start again.');
+          return;
+        }
+        const fresh = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records?per_page=100`);
+        if (fresh.success) {
+          setSession(userId, { records: fresh.result });
+          rec = fresh.result?.find((r) => r.id.startsWith(shortId));
+        }
+      }
+
+      if (!rec) {
+        await sendMessage(env, chatId, '❌ Record not found. Please refresh the list.', {
+          inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'records' }]],
+        });
         return;
       }
-      const { zoneId, zoneName } = session;
+
+      setSession(userId, { editRecordId: rec.id });
       const proxiedIcon = rec.proxied ? '🟠' : '⚪️';
       const info = `${proxiedIcon} <b>${rec.type}</b>\nName: <code>${rec.name}</code>\nContent: <code>${rec.content}</code>\nTTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
-      setSession(userId, { editRecordId: rec.id });
       await sendMessage(env, chatId, info, {
         inline_keyboard: [
           [
@@ -136,7 +160,6 @@ async function handleUpdate(env, update) {
       await sendMessage(env, chatId, 'Send: <code>field|value</code>\nFields: <code>name</code>, <code>content</code>, <code>ttl</code>, <code>proxied</code>\nExample: <code>content|1.2.3.4</code>');
 
     } else if (data.startsWith('dr:')) {
-      // dr:<sid(recId)>
       const shortId = data.slice(3);
       const rec = session.records?.find((r) => r.id.startsWith(shortId));
       const recId = rec?.id || session.editRecordId;
@@ -147,6 +170,7 @@ async function handleUpdate(env, update) {
       } else {
         await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
       }
+      resetStep(userId);
       await handleZoneMenu(env, chatId, zoneId, zoneName);
     }
     return;
@@ -155,9 +179,15 @@ async function handleUpdate(env, update) {
   const text = update.message?.text?.trim();
   if (!text) return;
 
+  if (text === '/start') {
+    sessions[userId] = {};
+    await handleStart(env, chatId);
+    return;
+  }
+
   if (session.step === 'add_type') {
     setSession(userId, { step: 'add_name', recType: text.toUpperCase() });
-    await sendMessage(env, chatId, 'Enter record <b>name</b> (e.g. <code>sub.example.com</code> or <code>@</code>):');
+    await sendMessage(env, chatId, 'Enter record <b>name</b> (e.g. <code>sub.example.com</code>):');
     return;
   }
 
@@ -188,8 +218,7 @@ async function handleUpdate(env, update) {
       await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
     }
     const { zoneId, zoneName } = session;
-    clearSession(userId);
-    setSession(userId, { zoneId, zoneName });
+    resetStep(userId);
     await handleZoneMenu(env, chatId, zoneId, zoneName);
     return;
   }
@@ -213,8 +242,7 @@ async function handleUpdate(env, update) {
       await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
     }
     const { zoneId, zoneName } = session;
-    clearSession(userId);
-    setSession(userId, { zoneId, zoneName });
+    resetStep(userId);
     await handleZoneMenu(env, chatId, zoneId, zoneName);
     return;
   }
@@ -261,13 +289,12 @@ async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
     await sendMessage(env, chatId, '❌ No DNS records found.', {
       inline_keyboard: [
         [{ text: '➕ Add Record', callback_data: 'addrec' }],
-        [{ text: '🔙 Back', callback_data: 'z:' }],
+        [{ text: '🔙 Back', callback_data: 'zone_menu' }],
       ],
     });
     return;
   }
 
-  // Store full records in session for later access
   setSession(userId, { records: result.result });
 
   const lines = result.result.map((rec, i) => {
@@ -277,12 +304,11 @@ async function handleListRecords(env, chatId, userId, zoneId, zoneName) {
 
   const text = `📋 <b>${zoneName}</b> — ${result.result.length} record(s)\n\n${lines.join('\n\n')}`;
 
-  // Use short IDs in callback_data (ri: = record info)
   const buttons = result.result.map((rec, i) => [
     { text: `${i + 1}. ${rec.type} — ${rec.name}`, callback_data: `ri:${sid(rec.id)}` },
   ]);
   buttons.push([{ text: '➕ Add Record', callback_data: 'addrec' }]);
-  buttons.push([{ text: '🔙 Back', callback_data: 'z:' }]);
+  buttons.push([{ text: '🔙 Back', callback_data: 'zone_menu' }]);
 
   await sendMessage(env, chatId, text, { inline_keyboard: buttons });
 }
