@@ -25,16 +25,20 @@ async function cfRequest(env, method, path, body = null) {
 }
 
 async function sendMessage(env, chatId, text, keyboard = null) {
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: 'HTML',
-  };
+  const body = { chat_id: chatId, text, parse_mode: 'HTML' };
   if (keyboard) body.reply_markup = keyboard;
   await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+async function answerCallback(env, callbackQueryId, text = '') {
+  await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
   });
 }
 
@@ -68,28 +72,35 @@ async function handleUpdate(env, update) {
   const session = getSession(userId);
 
   if (callbackQuery) {
+    // Always answer callback to stop loading spinner
+    await answerCallback(env, callbackQuery.id);
+
     const data = callbackQuery.data;
 
     if (data === 'list_zones') {
       await handleListZones(env, chatId);
+
     } else if (data.startsWith('zone:')) {
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
       await handleZoneMenu(env, chatId, zoneId, zoneName);
+
     } else if (data.startsWith('records:')) {
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { zoneId, zoneName });
       await handleListRecords(env, chatId, zoneId, zoneName);
+
     } else if (data.startsWith('addrec:')) {
       const parts = data.split(':');
       const zoneId = parts[1];
       const zoneName = parts.slice(2).join(':');
       setSession(userId, { step: 'add_type', zoneId, zoneName });
       await sendMessage(env, chatId, 'Enter record <b>type</b>:\n<code>A, AAAA, CNAME, TXT, MX, NS, SRV, CAA</code>');
+
     } else if (data.startsWith('edit:')) {
       const parts = data.split(':');
       const recId = parts[1];
@@ -97,6 +108,7 @@ async function handleUpdate(env, update) {
       const zoneName = parts.slice(3).join(':');
       setSession(userId, { step: 'edit_field', editRecordId: recId, zoneId, zoneName });
       await sendMessage(env, chatId, 'What to update? Send: <code>field|value</code>\nFields: <code>name</code>, <code>content</code>, <code>ttl</code>, <code>proxied</code>\nExample: <code>content|1.2.3.4</code>');
+
     } else if (data.startsWith('del:')) {
       const parts = data.split(':');
       const recId = parts[1];
@@ -109,6 +121,7 @@ async function handleUpdate(env, update) {
         await sendMessage(env, chatId, `❌ Error: ${JSON.stringify(result.errors)}`);
       }
       await handleZoneMenu(env, chatId, zoneId, zoneName);
+
     } else if (data === 'main_menu') {
       clearSession(userId);
       await handleStart(env, chatId);
@@ -194,7 +207,7 @@ async function handleStart(env, chatId) {
 async function handleListZones(env, chatId) {
   const result = await cfRequest(env, 'GET', '/zones?per_page=50');
   if (!result.success || !result.result?.length) {
-    await sendMessage(env, chatId, '❌ No zones found.');
+    await sendMessage(env, chatId, `❌ No zones found.\n<code>${JSON.stringify(result.errors)}</code>`);
     return;
   }
   const buttons = result.result.map((z) => [{ text: z.name, callback_data: `zone:${z.id}:${z.name}` }]);
@@ -215,12 +228,20 @@ async function handleZoneMenu(env, chatId, zoneId, zoneName) {
 
 async function handleListRecords(env, chatId, zoneId, zoneName) {
   const result = await cfRequest(env, 'GET', `/zones/${zoneId}/dns_records?per_page=100`);
-  if (!result.success || !result.result?.length) {
+
+  if (!result.success) {
+    await sendMessage(env, chatId, `❌ CF API Error:\n<code>${JSON.stringify(result.errors)}</code>`);
+    return;
+  }
+
+  if (!result.result || result.result.length === 0) {
     await sendMessage(env, chatId, '❌ No DNS records found.');
     return;
   }
+
   for (const rec of result.result) {
-    const info = `<b>${rec.type}</b> | <code>${rec.name}</code>\n→ <code>${rec.content}</code> | TTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
+    const proxiedIcon = rec.proxied ? '🟠' : '⚪️';
+    const info = `${proxiedIcon} <b>${rec.type}</b> | <code>${rec.name}</code>\n→ <code>${rec.content}</code>\nTTL: ${rec.ttl} | Proxied: ${rec.proxied}`;
     const keyboard = {
       inline_keyboard: [
         [
@@ -231,7 +252,8 @@ async function handleListRecords(env, chatId, zoneId, zoneName) {
     };
     await sendMessage(env, chatId, info, keyboard);
   }
-  await sendMessage(env, chatId, '─────', {
+
+  await sendMessage(env, chatId, `📊 Total: ${result.result.length} record(s)`, {
     inline_keyboard: [[{ text: '🔙 Back', callback_data: `zone:${zoneId}:${zoneName}` }]],
   });
 }
@@ -240,7 +262,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Temporary debug endpoint — remove after testing
+    // Temporary debug endpoint
     if (url.pathname === '/debug') {
       const result = await cfRequest(env, 'GET', '/zones/56d436913fe5c605d4fe40d10cefac09/dns_records?per_page=10');
       return new Response(JSON.stringify(result, null, 2), {
