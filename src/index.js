@@ -6,6 +6,9 @@
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 const CF_API = 'https://api.cloudflare.com/client/v4';
 
+// Record types that support Cloudflare proxy (orange cloud)
+const PROXYABLE_TYPES = ['A', 'AAAA', 'CNAME'];
+
 function isAllowed(env, userId) {
   const ids = (env.ALLOWED_IDS || '').split(',').map((id) => id.trim());
   return ids.includes(String(userId));
@@ -51,6 +54,7 @@ async function setMyCommands(env) {
       commands: [
         { command: 'start', description: '🌐 Main menu' },
         { command: 'domains', description: '🗂 List all domains' },
+        { command: 'quickadd', description: '⚡ Add DNS record in one line' },
         { command: 'help', description: '❓ How to use this bot' },
         { command: 'cancel', description: '❌ Cancel current action' },
       ],
@@ -92,6 +96,147 @@ const TLS_VERSIONS = {
   '1.3': { label: 'TLS 1.3', desc: 'Latest — fastest & most secure' },
 };
 
+/**
+ * Parses a quickadd input line into a structured DNS record object.
+ * Expected format: domain | type | name | content | ttl | proxied
+ * Returns { error } on failure, or { domain, type, name, content, ttl, proxied } on success.
+ */
+function parseQuickAdd(input) {
+  const parts = input.split('|').map((p) => p.trim());
+  if (parts.length !== 6) {
+    return { error: '❌ <b>Invalid format.</b>\nExpected exactly 6 fields separated by <code>|</code>\n\nFormat:\n<code>domain | type | name | content | ttl | proxied</code>' };
+  }
+
+  const [domain, rawType, name, content, rawTtl, rawProxied] = parts;
+
+  if (!domain || !domain.includes('.')) {
+    return { error: '❌ <b>Invalid domain.</b>\nExample: <code>example.com</code>' };
+  }
+
+  const validTypes = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA'];
+  const type = rawType.toUpperCase();
+  if (!validTypes.includes(type)) {
+    return { error: `❌ <b>Invalid record type:</b> <code>${rawType}</code>\nAllowed types: <code>${validTypes.join('  ')}</code>` };
+  }
+
+  if (!name) {
+    return { error: '❌ <b>Name is required.</b>\nUse <code>@</code> for root or a subdomain like <code>sub</code>' };
+  }
+
+  if (!content) {
+    return { error: '❌ <b>Content is required.</b>\nExample: <code>1.2.3.4</code> for A record' };
+  }
+
+  const ttl = parseInt(rawTtl);
+  if (isNaN(ttl) || ttl < 1) {
+    return { error: '❌ <b>Invalid TTL.</b>\nUse <code>1</code> for Auto or a number like <code>3600</code>' };
+  }
+
+  const proxiedLower = rawProxied.toLowerCase();
+  if (!['proxied', 'direct', 'true', 'false'].includes(proxiedLower)) {
+    return { error: '❌ <b>Invalid proxy value.</b>\nUse <code>proxied</code> or <code>direct</code>' };
+  }
+  const proxied = proxiedLower === 'proxied' || proxiedLower === 'true';
+
+  if (proxied && !PROXYABLE_TYPES.includes(type)) {
+    return { error: `❌ <b>Record type <code>${type}</code> does not support Cloudflare proxy.</b>\nOnly <code>A</code>, <code>AAAA</code>, and <code>CNAME</code> records can be proxied.\n\nChange the last field to <code>direct</code> and try again.` };
+  }
+
+  return { domain, type, name, content, ttl, proxied };
+}
+
+async function handleQuickAddCommand(env, chatId) {
+  await sendMessage(env, chatId,
+    '⚡ <b>Quick Add DNS Record</b>\n\n' +
+    'Send a single line in this format:\n' +
+    '<code>domain | type | name | content | ttl | proxied</code>\n\n' +
+    '📌 <b>Fields explained:</b>\n' +
+    '• <b>domain</b> — your Cloudflare domain (must be in your account)\n' +
+    '• <b>type</b> — record type: A, AAAA, CNAME, TXT, MX, NS, SRV, CAA\n' +
+    '• <b>name</b> — subdomain or <code>@</code> for root\n' +
+    '• <b>content</b> — IP address, hostname, or text value\n' +
+    '• <b>ttl</b> — <code>1</code> for Auto, or seconds like <code>3600</code>\n' +
+    '• <b>proxied</b> — <code>proxied</code> or <code>direct</code> (only A, AAAA, CNAME support proxy)\n\n' +
+    '📋 <b>Examples:</b>\n\n' +
+    '<code>example.com | A | @ | 1.2.3.4 | 1 | proxied</code>\n' +
+    '<i>→ Root A record, proxied</i>\n\n' +
+    '<code>example.com | A | sub | 1.2.3.4 | 1 | direct</code>\n' +
+    '<i>→ Subdomain A record, not proxied</i>\n\n' +
+    '<code>example.com | AAAA | ipv6sub | 2001:db8::1 | 1 | proxied</code>\n' +
+    '<i>→ IPv6 A record, proxied</i>\n\n' +
+    '<code>example.com | CNAME | www | target.example.net | 1 | proxied</code>\n' +
+    '<i>→ CNAME pointing to another host, proxied</i>\n\n' +
+    '<code>example.com | TXT | @ | v=spf1 include:_spf.example.com ~all | 1 | direct</code>\n' +
+    '<i>→ SPF TXT record (TXT cannot be proxied)</i>\n\n' +
+    '<code>example.com | MX | @ | mail.example.com | 3600 | direct</code>\n' +
+    '<i>→ MX record with custom TTL (MX cannot be proxied)</i>\n\n' +
+    '<code>example.com | NS | sub | ns1.example.com | 3600 | direct</code>\n' +
+    '<i>→ NS delegation record (NS cannot be proxied)</i>\n\n' +
+    '/cancel to abort',
+    { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'main_menu' }]] },
+  );
+}
+
+async function handleQuickAddInput(env, chatId, userId, text) {
+  const parsed = parseQuickAdd(text);
+  if (parsed.error) {
+    await sendMessage(env, chatId, parsed.error + '\n\n/quickadd to see examples again');
+    return;
+  }
+
+  const { domain, type, name, content, ttl, proxied } = parsed;
+
+  // Look up the zone by domain name
+  const zonesResult = await cfRequest(env, 'GET', `/zones?name=${encodeURIComponent(domain)}&per_page=5`);
+  if (!zonesResult.success || !zonesResult.result?.length) {
+    await sendMessage(env, chatId,
+      `❌ <b>Domain not found:</b> <code>${domain}</code>\n\nMake sure this domain exists in your Cloudflare account.\n\n/quickadd to try again`,
+    );
+    return;
+  }
+
+  const zone = zonesResult.result[0];
+
+  // Create the DNS record
+  const createResult = await cfRequest(env, 'POST', `/zones/${zone.id}/dns_records`, {
+    type,
+    name,
+    content,
+    ttl,
+    proxied,
+  });
+
+  if (!createResult.success) {
+    const errorMsg = createResult.errors?.map((e) => e.message).join(', ') || JSON.stringify(createResult.errors);
+    await sendMessage(env, chatId,
+      `❌ <b>Failed to add record.</b>\n\n<i>${errorMsg}</i>\n\n/quickadd to try again`,
+    );
+    return;
+  }
+
+  const rec = createResult.result;
+  const proxiedIcon = proxied ? '🟠 Proxied' : '⚪️ Direct';
+  await sendMessage(env, chatId,
+    `✅ <b>Record Added Successfully</b>\n\n` +
+    `Domain: <b>${domain}</b>\n` +
+    `Type: <b>${rec.type}</b>\n` +
+    `Name: <code>${rec.name}</code>\n` +
+    `Content: <code>${rec.content}</code>\n` +
+    `TTL: <code>${rec.ttl === 1 ? 'Auto' : rec.ttl}</code>\n` +
+    `Status: ${proxiedIcon}`,
+    {
+      inline_keyboard: [
+        [{ text: `📋 View Records for ${domain}`, callback_data: `zone:${zone.id}:${zone.name}` }],
+        [{ text: '⚡ Add Another', callback_data: 'quickadd_prompt' }],
+        [{ text: '🏠 Main Menu', callback_data: 'main_menu' }],
+      ],
+    },
+  );
+
+  // Clear quickadd step from session
+  resetStep(userId);
+}
+
 async function handleUpdate(env, update) {
   const msg = update.message || update.callback_query?.message;
   const callbackQuery = update.callback_query;
@@ -119,6 +264,10 @@ async function handleUpdate(env, update) {
 
     } else if (data === 'help') {
       await handleHelp(env, chatId);
+
+    } else if (data === 'quickadd_prompt') {
+      setSession(userId, { step: 'quickadd' });
+      await handleQuickAddCommand(env, chatId);
 
     } else if (data.startsWith('zone:')) {
       const parts = data.split(':');
@@ -223,10 +372,21 @@ async function handleUpdate(env, update) {
   if (text === '/start') { sessions[userId] = {}; await handleStart(env, chatId); return; }
   if (text === '/help') { await handleHelp(env, chatId); return; }
   if (text === '/domains') { await handleListZones(env, chatId); return; }
+  if (text === '/quickadd') {
+    setSession(userId, { step: 'quickadd' });
+    await handleQuickAddCommand(env, chatId);
+    return;
+  }
   if (text === '/cancel') {
     resetStep(userId);
     if (session.zoneId) await handleZoneMenu(env, chatId, session.zoneId, session.zoneName);
     else await handleStart(env, chatId);
+    return;
+  }
+
+  // Handle quickadd step — user sends the one-line record
+  if (session.step === 'quickadd') {
+    await handleQuickAddInput(env, chatId, userId, text);
     return;
   }
 
@@ -308,6 +468,7 @@ async function handleStart(env, chatId) {
     {
       inline_keyboard: [
         [{ text: '🗂 My Domains', callback_data: 'list_zones' }],
+        [{ text: '⚡ Quick Add DNS Record', callback_data: 'quickadd_prompt' }],
         [{ text: '❓ Help', callback_data: 'help' }],
       ],
     },
@@ -317,7 +478,8 @@ async function handleStart(env, chatId) {
 async function handleHelp(env, chatId) {
   await sendMessage(env, chatId,
     '❓ <b>Cloudflare Manager — Help</b>\n\n' +
-    '<b>Commands:</b>\n/start — Main menu\n/domains — List domains\n/help — This help\n/cancel — Cancel action\n\n' +
+    '<b>Commands:</b>\n/start — Main menu\n/domains — List domains\n/quickadd — Add DNS record in one line\n/help — This help\n/cancel — Cancel action\n\n' +
+    '<b>Quick Add format:</b>\n<code>domain | type | name | content | ttl | proxied</code>\n\n' +
     '<b>SSL/TLS Modes:</b>\n🔴 Off — HTTP only\n🟡 Flexible — HTTPS to visitor only\n🟢 Full — HTTPS both sides\n🔵 Strict — valid cert required\n\n' +
     '<b>Min TLS Version:</b>\nSets the minimum TLS version accepted by Cloudflare.\nRecommended: TLS 1.2 or 1.3\n\n' +
     '<b>Edit DNS record:</b>\nSend <code>field|value</code> e.g. <code>content|1.2.3.4</code>',
