@@ -74,6 +74,8 @@ https://cloudflare-manager.<your-subdomain>.workers.dev/setup
 curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://cloudflare-manager.<your-subdomain>.workers.dev"
 ```
 
+> **Note:** `bot` must be written directly before the token with no space or slash.
+
 ### 8. Start the bot
 
 Open your bot in Telegram and send `/start`.
@@ -97,8 +99,46 @@ Secrets are preserved between deploys — no need to re-enter them.
 |---------|-------------|
 | `/start` | Main menu |
 | `/domains` | List all domains |
+| `/quickadd` | Add a DNS record in one line |
 | `/help` | Usage guide |
 | `/cancel` | Cancel current action |
+
+---
+
+## Quick Add DNS Record
+
+The `/quickadd` command lets you add a DNS record in a single message without going through the step-by-step flow.
+
+### Format
+
+```
+domain | type | name | content | ttl | proxied
+```
+
+### Fields
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `domain` | Your Cloudflare domain (must exist in your account) | `example.com` |
+| `type` | Record type | `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `NS`, `SRV`, `CAA` |
+| `name` | Subdomain or `@` for root | `sub`, `@`, `www` |
+| `content` | IP address, hostname, or text value | `1.2.3.4` |
+| `ttl` | `1` for Auto, or seconds | `1`, `3600` |
+| `proxied` | `proxied` or `direct` | `proxied` |
+
+> **Note:** Only `A`, `AAAA`, and `CNAME` records support `proxied`. All other types must use `direct`.
+
+### Examples
+
+```
+example.com | A | @ | 1.2.3.4 | 1 | proxied
+example.com | A | sub | 1.2.3.4 | 1 | direct
+example.com | AAAA | ipv6sub | 2001:db8::1 | 1 | proxied
+example.com | CNAME | www | target.example.net | 1 | proxied
+example.com | TXT | @ | v=spf1 include:_spf.example.com ~all | 1 | direct
+example.com | MX | @ | mail.example.com | 3600 | direct
+example.com | NS | sub | ns1.example.com | 3600 | direct
+```
 
 ---
 
@@ -174,3 +214,18 @@ Make sure you use the **Global API Key** (not an API Token) for `CF_API_KEY`.
 Session was lost (Worker restarted and in-memory session cleared).
 
 **Fix:** Send `/start`, select your domain again, then continue.
+
+---
+
+### `curl: (35) schannel: ... CRYPT_E_REVOCATION_OFFLINE`
+
+SSL certificate revocation check failed — usually a network/VPN issue.
+
+**Fix:** Enable your proxy first, then retry:
+
+```bash
+proxy-on
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://..."
+```
+
+Alternatively, open the webhook URL directly in your browser.
